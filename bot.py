@@ -8,6 +8,7 @@ from app.handlers.user import router as user_router
 from app.handlers.search import router as search_router
 from app.keyboards.main_menu import main_menu_keyboard
 from app.middlewares.subscription import SubscriptionMiddleware
+from config import ADMIN_ID
 
 
 from aiogram.types import Message
@@ -29,11 +30,12 @@ dp.include_router(search_router)
 async def start(message: Message):
     add_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
     name = message.from_user.full_name or "do'stim"
+    is_admin = message.from_user.id == ADMIN_ID
     await message.answer(
         f"👋 Assalomu alaykum, <b>{name}</b> botimizga xush kelibsiz.\n\n"
         f"✍️ <i>Kino yoki multfilm kodini yuboring.</i>",
         parse_mode="HTML",
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_menu_keyboard(is_admin=is_admin),
     )
 
 
