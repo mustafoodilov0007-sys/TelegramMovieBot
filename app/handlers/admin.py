@@ -1,29 +1,46 @@
+"""
+Admin panel handlerlari.
+
+ESLATMA (tuzatish haqida):
+Avval bu faylda handler kodi umuman yo'q edi — uning o'rniga xato bilan
+ma'lumotlar bazasi kodi yozilgan edi, shuning uchun bot.py dagi
+`from app.handlers.admin import router` qatori darhol xato berardi
+va bot umuman ishga tushmasdi. Baza kodi endi o'z joyida
+(app/database/db.py), bu yerda esa haqiqiy admin handlerlari.
+"""
+
 import asyncio
-import sqlite3
 
 from aiogram import Bot, F, Router
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, FSInputFile, Message
+from aiogram.types import CallbackQuery, Message
 
-from config import ADMIN_ID, CHANNEL_ID, CHANNEL_URL
+from config import ADMIN_ID
 from app.database.db import (
-    DB_PATH,
-    add_movie as db_add_movie,
+    add_channel,
+    add_movie,
     count_movies,
     count_users,
+    delete_channel,
     delete_movie,
-    delete_setting,
     get_all_movies,
     get_all_user_ids,
+    get_channel,
+    get_channels,
     get_movie_by_code,
-    get_setting,
     get_total_views,
-    reload_connection,
     set_setting,
+    update_channel,
     update_movie,
 )
-from app.keyboards.admin_menu import admin_menu_keyboard, channel_settings_keyboard
+from app.keyboards.admin_menu import (
+    admin_menu_keyboard,
+    channel_delete_confirm_keyboard,
+    channel_detail_keyboard,
+    channels_list_keyboard,
+)
 from app.keyboards.category import category_keyboard
 from app.keyboards.movie_actions import (
     category_edit_keyboard,
@@ -34,213 +51,318 @@ from app.keyboards.movie_list import PAGE_SIZE, movie_list_keyboard
 
 router = Router()
 
-
-class AddMovie(StatesGroup):
-    video = State()
-    title = State()
-    category = State()
-    part = State()
-    code = State()
+CATEGORY_LABEL = {"kino": "🟦 Kino", "multfilm": "🟪 Multfilm"}
 
 
-class EditMovie(StatesGroup):
-    waiting_value = State()
-    waiting_video = State()
-
-
-class RestoreDB(StatesGroup):
-    waiting_file = State()
-
-
-class Broadcast(StatesGroup):
-    waiting_message = State()
-
-
-class ChannelSetup(StatesGroup):
-    waiting_link = State()
-    waiting_forward = State()
-
-
-def _is_admin(user_id: int) -> bool:
+def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
 
 
-def _movie_info_text(movie) -> str:
-    category = movie[5] or "kino"
-    part = movie[6] or 1
-    return (
-        f"🎬 <b>{movie[2]}</b>\n"
-        f"🔢 Kod: <code>{movie[1]}</code>\n"
-        f"📂 Kategoriya: {category}\n"
-        f"🔁 Qism: {part}"
-    )
+# =========================
+# FSM HOLATLARI
+# =========================
+
+class AddMovie(StatesGroup):
+    category = State()
+    code = State()
+    title = State()
+    aliases = State()
+    part = State()
+    video = State()
 
 
-# ---------- Admin panel bosh menyu ----------
+class EditMovie(StatesGroup):
+    title = State()
+    code = State()
+    part = State()
+    video = State()
 
-@router.message(F.text == "/admin")
-async def admin_panel(message: Message):
-    if not _is_admin(message.from_user.id):
+
+class Broadcast(StatesGroup):
+    message = State()
+
+
+class SupportText(StatesGroup):
+    text = State()
+
+
+class ChannelAdd(StatesGroup):
+    channel_id = State()
+    url = State()
+    title = State()
+
+
+class ChannelEdit(StatesGroup):
+    channel_id = State()
+    url = State()
+    title = State()
+
+
+# =========================
+# ASOSIY MENYU
+# =========================
+
+@router.message(Command("admin"))
+async def admin_command(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
         return
-    await message.answer("⚙️ Admin panel:", reply_markup=admin_menu_keyboard())
+    await state.clear()
+    await message.answer("⚙️ <b>Admin panel</b>", parse_mode="HTML",
+                         reply_markup=admin_menu_keyboard())
 
 
 @router.callback_query(F.data == "admin_home")
-async def admin_home(callback: CallbackQuery):
-    if not _is_admin(callback.from_user.id):
-        return
-    await callback.message.edit_text("⚙️ Admin panel:", reply_markup=admin_menu_keyboard())
+async def admin_home(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    await state.clear()
+    await callback.message.edit_text("⚙️ <b>Admin panel</b>", parse_mode="HTML",
+                                     reply_markup=admin_menu_keyboard())
     await callback.answer()
 
 
-# ---------- Kino/multfilm qo'shish ----------
-
-@router.message(F.text == "/add")
-async def add_movie_command(message: Message, state: FSMContext):
-    if not _is_admin(message.from_user.id):
+@router.message(Command("bekor"))
+async def cancel_any(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
         return
-    await message.answer("🎬 Kino/multfilm videosini yuboring.")
-    await state.set_state(AddMovie.video)
+    if await state.get_state() is None:
+        return
+    await state.clear()
+    await message.answer("❌ Bekor qilindi.", reply_markup=admin_menu_keyboard())
 
+
+# =========================
+# KINO QO'SHISH
+# =========================
 
 @router.callback_query(F.data == "admin_add")
-async def add_movie_callback(callback: CallbackQuery, state: FSMContext):
-    if not _is_admin(callback.from_user.id):
-        return
-    await callback.message.edit_text("🎬 Kino/multfilm videosini yuboring.")
-    await state.set_state(AddMovie.video)
-    await callback.answer()
-
-
-@router.message(AddMovie.video, F.video)
-async def get_video(message: Message, state: FSMContext):
-    await state.update_data(file_id=message.video.file_id)
-    await message.answer("📝 Nomini kiriting.")
-    await state.set_state(AddMovie.title)
-
-
-@router.message(AddMovie.title)
-async def get_title(message: Message, state: FSMContext):
-    await state.update_data(title=message.text)
-    await message.answer("📂 Kategoriyasini tanlang:", reply_markup=category_keyboard())
+async def add_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
     await state.set_state(AddMovie.category)
+    await callback.message.edit_text("📂 Kategoriyani tanlang:", reply_markup=category_keyboard())
+    await callback.answer()
 
 
 @router.callback_query(AddMovie.category, F.data.startswith("cat_"))
-async def choose_category(callback: CallbackQuery, state: FSMContext):
-    category = "kino" if callback.data == "cat_kino" else "multfilm"
+async def add_category(callback: CallbackQuery, state: FSMContext):
+    category = callback.data.removeprefix("cat_")
     await state.update_data(category=category)
+    await state.set_state(AddMovie.code)
     await callback.message.edit_text(
-        "🔁 Nechanchi qism? (Agar bitta bo'lsa — <b>1</b> deb yozing)",
+        f"{CATEGORY_LABEL.get(category, category)} tanlandi.\n\n"
+        "🔢 Endi <b>kod</b> yuboring (masalan: <code>101</code>).\n\n"
+        "<i>Bekor qilish uchun /bekor</i>",
         parse_mode="HTML",
     )
-    await state.set_state(AddMovie.part)
     await callback.answer()
 
 
-@router.message(AddMovie.part)
-async def get_part(message: Message, state: FSMContext):
-    text = message.text.strip()
-    if not text.isdigit() or int(text) < 1:
-        await message.answer("⚠️ Faqat musbat raqam kiriting (masalan: 1).")
-        return
-    await state.update_data(part=int(text))
-    await message.answer("🔢 Kodini kiriting (masalan: 101).")
-    await state.set_state(AddMovie.code)
-
-
 @router.message(AddMovie.code)
-async def save_movie(message: Message, state: FSMContext):
+async def add_code(message: Message, state: FSMContext):
     code = message.text.strip()
-    data = await state.get_data()
-
-    try:
-        db_add_movie(
-            code=code,
-            title=data["title"],
-            aliases=data["title"].lower(),
-            file_id=data["file_id"],
-            category=data.get("category", "kino"),
-            part=data.get("part", 1),
-        )
-    except sqlite3.IntegrityError:
-        await message.answer("⚠️ Bu kod band, boshqa kod kiriting.")
+    if get_movie_by_code(code):
+        await message.answer("⚠️ Bu kod band. Boshqa kod yuboring.")
         return
+    await state.update_data(code=code)
+    await state.set_state(AddMovie.title)
+    await message.answer("📝 <b>Nomini</b> yuboring:", parse_mode="HTML")
 
-    await message.answer("✅ Bazaga saqlandi.", reply_markup=admin_menu_keyboard())
+
+@router.message(AddMovie.title)
+async def add_title(message: Message, state: FSMContext):
+    await state.update_data(title=message.text.strip())
+    await state.set_state(AddMovie.aliases)
+    await message.answer(
+        "🔎 Qidiruv uchun <b>qo'shimcha nomlar</b>ni vergul bilan yuboring.\n"
+        "<i>Kerak bo'lmasa «-» yuboring.</i>",
+        parse_mode="HTML",
+    )
+
+
+@router.message(AddMovie.aliases)
+async def add_aliases(message: Message, state: FSMContext):
+    aliases = message.text.strip()
+    await state.update_data(aliases="" if aliases == "-" else aliases)
+    await state.set_state(AddMovie.part)
+    await message.answer(
+        "🔁 <b>Qism raqami</b>ni yuboring (oddiy kino bo'lsa <code>1</code>):",
+        parse_mode="HTML",
+    )
+
+
+@router.message(AddMovie.part)
+async def add_part(message: Message, state: FSMContext):
+    try:
+        part = int(message.text.strip())
+    except ValueError:
+        await message.answer("⚠️ Faqat raqam yuboring (masalan: 1).")
+        return
+    await state.update_data(part=max(1, part))
+    await state.set_state(AddMovie.video)
+    await message.answer("🎞 Endi <b>videoni</b> yuboring:", parse_mode="HTML")
+
+
+@router.message(AddMovie.video, F.video)
+async def add_video(message: Message, state: FSMContext):
+    data = await state.get_data()
+    add_movie(
+        code=data["code"],
+        title=data["title"],
+        aliases=data.get("aliases", ""),
+        file_id=message.video.file_id,
+        category=data.get("category", "kino"),
+        part=data.get("part", 1),
+    )
     await state.clear()
+    await message.answer(
+        f"✅ Saqlandi!\n\n🔢 Kod: <code>{data['code']}</code>\n📝 Nomi: {data['title']}",
+        parse_mode="HTML",
+        reply_markup=admin_menu_keyboard(),
+    )
 
 
-# ---------- Ro'yxat va boshqaruv ----------
+@router.message(AddMovie.video)
+async def add_video_invalid(message: Message):
+    await message.answer("⚠️ Iltimos, <b>video</b> yuboring.", parse_mode="HTML")
+
+
+# =========================
+# RO'YXAT VA BOSHQARUV
+# =========================
 
 @router.callback_query(F.data.startswith("list_"))
-async def list_movies(callback: CallbackQuery):
-    if not _is_admin(callback.from_user.id):
-        return
-    offset = int(callback.data.removeprefix("list_"))
-    total = count_movies()
+async def list_movies(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    await state.clear()
 
-    if total == 0:
-        await callback.message.edit_text("📭 Baza hozircha bo'sh.", reply_markup=admin_menu_keyboard())
-        await callback.answer()
-        return
+    _, category, offset = callback.data.split("_", 2)
+    offset = int(offset)
+    db_category = None if category == "all" else category
 
-    movies = get_all_movies(offset=offset, limit=PAGE_SIZE)
+    total = count_movies(category=db_category)
+    movies = get_all_movies(offset=offset, limit=PAGE_SIZE, category=db_category)
+
+    if not movies:
+        text = "📭 Bu bo'limda hech narsa yo'q."
+    else:
+        text = f"🔵 <b>Ro'yxat</b> — jami {total} ta\n\nTahrirlash uchun tanlang:"
+
     await callback.message.edit_text(
-        f"📋 Kinolar va multfilmlar ({total} ta):",
-        reply_markup=movie_list_keyboard(movies, offset, total),
+        text, parse_mode="HTML",
+        reply_markup=movie_list_keyboard(movies, offset, total, category),
     )
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith("manage_"))
-async def manage_movie(callback: CallbackQuery):
-    if not _is_admin(callback.from_user.id):
-        return
+async def manage_movie(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    await state.clear()
+
     code = callback.data.removeprefix("manage_")
     movie = get_movie_by_code(code)
     if not movie:
-        await callback.answer("❌ Topilmadi.", show_alert=True)
+        await callback.answer("Topilmadi", show_alert=True)
         return
+
     await callback.message.edit_text(
-        _movie_info_text(movie), reply_markup=movie_actions_keyboard(code), parse_mode="HTML"
+        f"🎬 <b>{movie[2]}</b>\n\n"
+        f"🔢 Kod: <code>{movie[1]}</code>\n"
+        f"📂 Kategoriya: {CATEGORY_LABEL.get(movie[5], movie[5])}\n"
+        f"🔁 Qism: {movie[6] or 1}\n"
+        f"👁 Ko'rishlar: {movie[7] or 0}\n"
+        f"🔎 Qo'shimcha nomlar: {movie[3] or '—'}",
+        parse_mode="HTML",
+        reply_markup=movie_actions_keyboard(code),
     )
     await callback.answer()
 
 
-# ---------- Tahrirlash ----------
-
 @router.callback_query(F.data.startswith("edit_title_"))
-async def edit_title(callback: CallbackQuery, state: FSMContext):
+async def edit_title_start(callback: CallbackQuery, state: FSMContext):
     code = callback.data.removeprefix("edit_title_")
-    await state.update_data(field="title", code=code)
-    await state.set_state(EditMovie.waiting_value)
-    await callback.message.edit_text("📝 Yangi nomni kiriting.")
+    await state.set_state(EditMovie.title)
+    await state.update_data(code=code)
+    await callback.message.answer("📝 Yangi <b>nom</b>ni yuboring:", parse_mode="HTML")
     await callback.answer()
+
+
+@router.message(EditMovie.title)
+async def edit_title_save(message: Message, state: FSMContext):
+    data = await state.get_data()
+    update_movie(data["code"], title=message.text.strip())
+    await state.clear()
+    await message.answer("✅ Nom yangilandi.", reply_markup=admin_menu_keyboard())
 
 
 @router.callback_query(F.data.startswith("edit_code_"))
-async def edit_code(callback: CallbackQuery, state: FSMContext):
+async def edit_code_start(callback: CallbackQuery, state: FSMContext):
     code = callback.data.removeprefix("edit_code_")
-    await state.update_data(field="code", code=code)
-    await state.set_state(EditMovie.waiting_value)
-    await callback.message.edit_text("🔢 Yangi kodni kiriting.")
+    await state.set_state(EditMovie.code)
+    await state.update_data(code=code)
+    await callback.message.answer("🔢 Yangi <b>kod</b>ni yuboring:", parse_mode="HTML")
     await callback.answer()
+
+
+@router.message(EditMovie.code)
+async def edit_code_save(message: Message, state: FSMContext):
+    new_code = message.text.strip()
+    if get_movie_by_code(new_code):
+        await message.answer("⚠️ Bu kod band. Boshqasini yuboring.")
+        return
+    data = await state.get_data()
+    update_movie(data["code"], code=new_code)
+    await state.clear()
+    await message.answer("✅ Kod yangilandi.", reply_markup=admin_menu_keyboard())
 
 
 @router.callback_query(F.data.startswith("edit_part_"))
-async def edit_part(callback: CallbackQuery, state: FSMContext):
+async def edit_part_start(callback: CallbackQuery, state: FSMContext):
     code = callback.data.removeprefix("edit_part_")
-    await state.update_data(field="part", code=code)
-    await state.set_state(EditMovie.waiting_value)
-    await callback.message.edit_text("🔁 Yangi qism raqamini kiriting (masalan: 2).")
+    await state.set_state(EditMovie.part)
+    await state.update_data(code=code)
+    await callback.message.answer("🔁 Yangi <b>qism raqami</b>ni yuboring:", parse_mode="HTML")
     await callback.answer()
 
 
+@router.message(EditMovie.part)
+async def edit_part_save(message: Message, state: FSMContext):
+    try:
+        part = max(1, int(message.text.strip()))
+    except ValueError:
+        await message.answer("⚠️ Faqat raqam yuboring.")
+        return
+    data = await state.get_data()
+    update_movie(data["code"], part=part)
+    await state.clear()
+    await message.answer("✅ Qism raqami yangilandi.", reply_markup=admin_menu_keyboard())
+
+
+@router.callback_query(F.data.startswith("edit_video_"))
+async def edit_video_start(callback: CallbackQuery, state: FSMContext):
+    code = callback.data.removeprefix("edit_video_")
+    await state.set_state(EditMovie.video)
+    await state.update_data(code=code)
+    await callback.message.answer("🎞 Yangi <b>videoni</b> yuboring:", parse_mode="HTML")
+    await callback.answer()
+
+
+@router.message(EditMovie.video, F.video)
+async def edit_video_save(message: Message, state: FSMContext):
+    data = await state.get_data()
+    update_movie(data["code"], file_id=message.video.file_id)
+    await state.clear()
+    await message.answer("✅ Video almashtirildi.", reply_markup=admin_menu_keyboard())
+
+
 @router.callback_query(F.data.startswith("edit_category_"))
-async def edit_category(callback: CallbackQuery):
+async def edit_category_start(callback: CallbackQuery):
     code = callback.data.removeprefix("edit_category_")
-    await callback.message.edit_text("📂 Yangi kategoriyani tanlang:", reply_markup=category_edit_keyboard(code))
+    await callback.message.edit_text("📂 Yangi kategoriyani tanlang:",
+                                     reply_markup=category_edit_keyboard(code))
     await callback.answer()
 
 
@@ -248,293 +370,240 @@ async def edit_category(callback: CallbackQuery):
 async def set_category(callback: CallbackQuery):
     _, category, code = callback.data.split("_", 2)
     update_movie(code, category=category)
+    await callback.answer("✅ Kategoriya yangilandi")
     movie = get_movie_by_code(code)
+    if movie:
+        await callback.message.edit_text(
+            f"🎬 <b>{movie[2]}</b>\n\n"
+            f"🔢 Kod: <code>{movie[1]}</code>\n"
+            f"📂 Kategoriya: {CATEGORY_LABEL.get(movie[5], movie[5])}\n"
+            f"🔁 Qism: {movie[6] or 1}\n"
+            f"👁 Ko'rishlar: {movie[7] or 0}",
+            parse_mode="HTML",
+            reply_markup=movie_actions_keyboard(code),
+        )
+
+
+@router.callback_query(F.data.startswith("delete_"))
+async def delete_ask(callback: CallbackQuery):
+    code = callback.data.removeprefix("delete_")
     await callback.message.edit_text(
-        "✅ Kategoriya yangilandi.\n\n" + _movie_info_text(movie),
-        reply_markup=movie_actions_keyboard(code),
-        parse_mode="HTML",
+        f"🗑 <code>{code}</code> o'chirilsinmi?", parse_mode="HTML",
+        reply_markup=confirm_delete_keyboard(code),
     )
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("edit_video_"))
-async def edit_video_start(callback: CallbackQuery, state: FSMContext):
-    code = callback.data.removeprefix("edit_video_")
-    await state.update_data(code=code)
-    await state.set_state(EditMovie.waiting_video)
-    await callback.message.edit_text("🎞 Yangi videoni yuboring.")
-    await callback.answer()
-
-
-@router.message(EditMovie.waiting_video, F.video)
-async def edit_video_save(message: Message, state: FSMContext):
-    data = await state.get_data()
-    update_movie(data["code"], file_id=message.video.file_id)
-    await message.answer("✅ Video yangilandi.", reply_markup=admin_menu_keyboard())
-    await state.clear()
-
-
-@router.message(EditMovie.waiting_value)
-async def edit_value_save(message: Message, state: FSMContext):
-    data = await state.get_data()
-    field = data["field"]
-    code = data["code"]
-    value = message.text.strip()
-
-    if field == "part":
-        if not value.isdigit() or int(value) < 1:
-            await message.answer("⚠️ Faqat musbat raqam kiriting (masalan: 2).")
-            return
-        value = int(value)
-
-    try:
-        update_movie(code, **{field: value})
-    except sqlite3.IntegrityError:
-        await message.answer("⚠️ Bu kod band, boshqasini kiriting.")
-        return
-
-    await message.answer("✅ Yangilandi.", reply_markup=admin_menu_keyboard())
-    await state.clear()
-
-
-# ---------- O'chirish ----------
-
-@router.callback_query(F.data.startswith("delete_"))
-async def delete_confirm(callback: CallbackQuery):
-    code = callback.data.removeprefix("delete_")
-    await callback.message.edit_text("🗑 Rostdan ham o'chirmoqchimisiz?", reply_markup=confirm_delete_keyboard(code))
-    await callback.answer()
-
-
 @router.callback_query(F.data.startswith("confirmdelete_"))
-async def delete_execute(callback: CallbackQuery):
+async def delete_confirm(callback: CallbackQuery):
     code = callback.data.removeprefix("confirmdelete_")
     delete_movie(code)
     await callback.message.edit_text("✅ O'chirildi.", reply_markup=admin_menu_keyboard())
     await callback.answer()
 
 
-# ---------- Baza zaxirasi (backup / restore) ----------
-
-@router.message(F.text == "/backup")
-async def backup_db(message: Message):
-    if not _is_admin(message.from_user.id):
-        return
-    await message.answer_document(FSInputFile(DB_PATH), caption="🗄 Joriy baza fayli.")
-
-
-@router.message(F.text == "/restore")
-async def restore_db_start(message: Message, state: FSMContext):
-    if not _is_admin(message.from_user.id):
-        return
-    await message.answer(
-        "⚠️ Diqqat! Yuboradigan .db fayl joriy bazani <b>to'liq almashtiradi</b>.\n\n"
-        "Zaxira faylni (.db) hujjat sifatida yuboring.",
-        parse_mode="HTML",
-    )
-    await state.set_state(RestoreDB.waiting_file)
-
-
-@router.message(RestoreDB.waiting_file, F.document)
-async def restore_db_file(message: Message, state: FSMContext, bot: Bot):
-    file = await bot.get_file(message.document.file_id)
-    await bot.download_file(file.file_path, destination=DB_PATH)
-    reload_connection()
-    await message.answer("✅ Baza muvaffaqiyatli tiklandi.", reply_markup=admin_menu_keyboard())
-    await state.clear()
-
-
-# ---------- Statistika ----------
+# =========================
+# STATISTIKA
+# =========================
 
 @router.callback_query(F.data == "admin_stats")
-async def admin_stats(callback: CallbackQuery):
-    if not _is_admin(callback.from_user.id):
-        return
-    text = (
-        "📊 <b>Statistika</b>\n\n"
-        f"👥 Obunachilar: {count_users()}\n"
-        f"🎬 Kino/multfilmlar soni: {count_movies()}\n"
-        f"👁 Jami ko'rishlar: {get_total_views()}"
+async def stats(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    await callback.message.edit_text(
+        "🟡 <b>Statistika</b>\n\n"
+        f"👥 Foydalanuvchilar: <b>{count_users()}</b>\n"
+        f"🟦 Kinolar: <b>{count_movies('kino')}</b>\n"
+        f"🟪 Multfilmlar: <b>{count_movies('multfilm')}</b>\n"
+        f"🎬 Jami: <b>{count_movies()}</b>\n"
+        f"👁 Jami ko'rishlar: <b>{get_total_views()}</b>",
+        parse_mode="HTML",
+        reply_markup=admin_menu_keyboard(),
     )
-    await callback.message.edit_text(text, reply_markup=admin_menu_keyboard(), parse_mode="HTML")
     await callback.answer()
 
 
-# ---------- Xabar yuborish (reklama / e'lon) ----------
+# =========================
+# XABAR YUBORISH
+# =========================
 
 @router.callback_query(F.data == "admin_broadcast")
 async def broadcast_start(callback: CallbackQuery, state: FSMContext):
-    if not _is_admin(callback.from_user.id):
-        return
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    await state.set_state(Broadcast.message)
     await callback.message.edit_text(
-        "📢 Barcha obunachilarga yubormoqchi bo'lgan xabaringizni yuboring "
-        "(matn, rasm, video — istalgani).\n\nBekor qilish uchun /bekor deb yozing."
+        "🟣 Yubormoqchi bo'lgan xabaringizni yuboring.\n\n<i>Bekor qilish: /bekor</i>",
+        parse_mode="HTML",
     )
-    await state.set_state(Broadcast.waiting_message)
     await callback.answer()
 
 
-@router.message(F.text == "/xabar")
-async def broadcast_command(message: Message, state: FSMContext):
-    if not _is_admin(message.from_user.id):
-        return
-    await message.answer(
-        "📢 Barcha obunachilarga yubormoqchi bo'lgan xabaringizni yuboring "
-        "(matn, rasm, video — istalgani).\n\nBekor qilish uchun /bekor deb yozing."
-    )
-    await state.set_state(Broadcast.waiting_message)
-
-
-@router.message(F.text == "/bekor", Broadcast.waiting_message)
-async def broadcast_cancel(message: Message, state: FSMContext):
-    if not _is_admin(message.from_user.id):
-        return
+@router.message(Broadcast.message)
+async def broadcast_send(message: Message, state: FSMContext, bot: Bot):
     await state.clear()
-    await message.answer("❌ Bekor qilindi.", reply_markup=admin_menu_keyboard())
-
-
-@router.message(Broadcast.waiting_message)
-async def broadcast_send(message: Message, state: FSMContext):
-    if not _is_admin(message.from_user.id):
-        return
-    await state.clear()
-
     user_ids = get_all_user_ids()
-    total = len(user_ids)
-    if total == 0:
-        await message.answer("📭 Hozircha obunachilar yo'q.")
-        return
-
-    status = await message.answer(f"⏳ Yuborilmoqda... 0/{total}")
     sent, failed = 0, 0
 
-    for i, user_id in enumerate(user_ids, start=1):
+    status = await message.answer(f"📤 Yuborilmoqda… (0/{len(user_ids)})")
+
+    for i, uid in enumerate(user_ids, start=1):
         try:
-            await message.copy_to(chat_id=user_id)
+            await message.send_copy(chat_id=uid)
             sent += 1
         except Exception:
             failed += 1
-        if i % 20 == 0 or i == total:
+        if i % 25 == 0:
             try:
-                await status.edit_text(f"⏳ Yuborilmoqda... {i}/{total}")
+                await status.edit_text(f"📤 Yuborilmoqda… ({i}/{len(user_ids)})")
             except Exception:
                 pass
-        await asyncio.sleep(0.05)  # Telegram flood-limitiga tushmaslik uchun
+        await asyncio.sleep(0.05)  # Telegram limitiga urilmaslik uchun
 
     await status.edit_text(
-        f"✅ Xabar yuborildi.\n\n📤 Yetib bordi: {sent}\n❌ Yetib bormadi: {failed}"
+        f"✅ Yakunlandi.\n\n📨 Yuborildi: <b>{sent}</b>\n⚠️ Yetib bormadi: <b>{failed}</b>",
+        parse_mode="HTML",
     )
+    await message.answer("⚙️ Admin panel", reply_markup=admin_menu_keyboard())
 
 
-# ---------- Majburiy obuna kanali ----------
+# =========================
+# QO'LLAB-QUVVATLASH MATNI
+# =========================
+
+@router.callback_query(F.data == "admin_support")
+async def support_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    await state.set_state(SupportText.text)
+    await callback.message.edit_text(
+        "💛 Yangi <b>qo'llab-quvvatlash matni</b>ni yuboring.\n\n<i>Bekor qilish: /bekor</i>",
+        parse_mode="HTML",
+    )
+    await callback.answer()
+
+
+@router.message(SupportText.text)
+async def support_save(message: Message, state: FSMContext):
+    set_setting("support_text", message.html_text or message.text)
+    await state.clear()
+    await message.answer("✅ Matn saqlandi.", reply_markup=admin_menu_keyboard())
+
+
+# =========================
+# MAJBURIY OBUNA KANALLARI
+# =========================
 
 @router.callback_query(F.data == "admin_channel")
-async def channel_settings(callback: CallbackQuery):
-    if not _is_admin(callback.from_user.id):
-        return
-    channel_id = get_setting("channel_id", CHANNEL_ID)
-    channel_url = get_setting("channel_url", CHANNEL_URL)
-    has_channel = bool(channel_id)
-
-    text = "🔒 <b>Majburiy obuna kanali</b>\n\n"
-    if has_channel:
-        text += (
-            f"✅ Hozir sozlangan.\n"
-            f"🔗 Link: {channel_url}\n"
-            f"🆔 ID: <code>{channel_id}</code>\n\n"
-            f"Foydalanuvchilar botdan foydalanishdan oldin shu kanalga obuna bo'lishi shart."
-        )
-    else:
-        text += "❌ Hozircha majburiy obuna kanali sozlanmagan.\nIstalgan foydalanuvchi botdan erkin foydalana oladi."
-
-    await callback.message.edit_text(
-        text, reply_markup=channel_settings_keyboard(has_channel), parse_mode="HTML"
-    )
+async def channels_list(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return await callback.answer()
+    await state.clear()
+    channels = get_channels()
+    text = ("🟠 <b>Majburiy obuna kanallari</b>\n\nHozircha kanal qo'shilmagan."
+            if not channels else
+            f"🟠 <b>Majburiy obuna kanallari</b>\n\nJami: {len(channels)} ta")
+    await callback.message.edit_text(text, parse_mode="HTML",
+                                     reply_markup=channels_list_keyboard(channels))
     await callback.answer()
 
 
 @router.callback_query(F.data == "channel_add")
 async def channel_add_start(callback: CallbackQuery, state: FSMContext):
-    if not _is_admin(callback.from_user.id):
-        return
+    await state.set_state(ChannelAdd.channel_id)
     await callback.message.edit_text(
-        "1️⃣ Kanalning ochiq linkini yuboring.\n\n"
-        "Masalan: https://t.me/mychannel yoki https://t.me/+AbCdEfGh12345 "
-        "(yopiq kanal bo'lsa, taklif linkini yuboring).\n\n"
-        "Bekor qilish uchun /bekor deb yozing."
-    )
-    await state.set_state(ChannelSetup.waiting_link)
-    await callback.answer()
-
-
-@router.callback_query(F.data == "channel_remove")
-async def channel_remove(callback: CallbackQuery):
-    if not _is_admin(callback.from_user.id):
-        return
-    delete_setting("channel_id")
-    delete_setting("channel_url")
-    await callback.message.edit_text(
-        "✅ Majburiy obuna o'chirildi. Endi bot hamma uchun erkin ishlaydi.",
-        reply_markup=admin_menu_keyboard(),
+        "📢 Kanal <b>ID</b> yoki <b>@username</b>ini yuboring.\n\n"
+        "<i>Muhim: bot o'sha kanalda admin bo'lishi shart!</i>\n"
+        "<i>Bekor qilish: /bekor</i>",
+        parse_mode="HTML",
     )
     await callback.answer()
 
 
-@router.message(ChannelSetup.waiting_link, F.text == "/bekor")
-@router.message(ChannelSetup.waiting_forward, F.text == "/bekor")
-async def channel_setup_cancel(message: Message, state: FSMContext):
-    if not _is_admin(message.from_user.id):
-        return
-    await state.clear()
-    await message.answer("❌ Bekor qilindi.", reply_markup=admin_menu_keyboard())
+@router.message(ChannelAdd.channel_id)
+async def channel_add_id(message: Message, state: FSMContext):
+    await state.update_data(channel_id=message.text.strip())
+    await state.set_state(ChannelAdd.url)
+    await message.answer("🔗 Kanal <b>havolasi</b>ni yuboring:", parse_mode="HTML")
 
 
-@router.message(ChannelSetup.waiting_link)
-async def channel_get_link(message: Message, state: FSMContext):
-    if not _is_admin(message.from_user.id):
-        return
-    link = message.text.strip()
-    if not link.startswith("http"):
-        await message.answer("⚠️ Iltimos, to'g'ri link yuboring (https:// bilan boshlansin).")
-        return
-    await state.update_data(channel_url=link)
-    await message.answer(
-        "2️⃣ Endi botni SHU KANALGA ADMIN qilib qo'ying (agar hali qilmagan bo'lsangiz), "
-        "so'ng o'sha kanaldan istalgan bitta postni ushbu chatga FORWARD qiling — "
-        "bot kanalni shundan avtomatik aniqlaydi.\n\n"
-        "Bekor qilish uchun /bekor deb yozing."
-    )
-    await state.set_state(ChannelSetup.waiting_forward)
+@router.message(ChannelAdd.url)
+async def channel_add_url(message: Message, state: FSMContext):
+    await state.update_data(url=message.text.strip())
+    await state.set_state(ChannelAdd.title)
+    await message.answer("🏷 Kanal <b>nomi</b>ni yuboring:", parse_mode="HTML")
 
 
-@router.message(ChannelSetup.waiting_forward)
-async def channel_get_forward(message: Message, state: FSMContext, bot: Bot):
-    if not _is_admin(message.from_user.id):
-        return
-    chat = message.forward_from_chat
-    if not chat or chat.type != "channel":
-        await message.answer(
-            "⚠️ Bu kanal posti emas. Iltimos, kanaldagi istalgan bitta xabarni "
-            "shu yerga forward qiling."
-        )
-        return
-
-    channel_id = chat.id
-    try:
-        await bot.get_chat_member(chat_id=channel_id, user_id=bot.id)
-    except Exception:
-        await message.answer(
-            "⚠️ Bot ushbu kanalda topilmadi. Iltimos, botni kanalga "
-            "ADMIN sifatida qo'shing va qayta forward qiling."
-        )
-        return
-
+@router.message(ChannelAdd.title)
+async def channel_add_title(message: Message, state: FSMContext):
     data = await state.get_data()
-    channel_url = data.get("channel_url", "")
-    set_setting("channel_id", str(channel_id))
-    set_setting("channel_url", channel_url)
+    add_channel(data["channel_id"], data["url"], message.text.strip())
     await state.clear()
-    await message.answer(
-        f"✅ Majburiy obuna kanali sozlandi!\n\n🔗 {channel_url}",
-        reply_markup=admin_menu_keyboard(),
+    await message.answer("✅ Kanal qo'shildi.", reply_markup=admin_menu_keyboard())
+
+
+@router.callback_query(F.data.startswith("chinfo_"))
+async def channel_info(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    row_id = int(callback.data.removeprefix("chinfo_"))
+    ch = get_channel(row_id)
+    if not ch:
+        await callback.answer("Topilmadi", show_alert=True)
+        return
+    await callback.message.edit_text(
+        f"📢 <b>{ch[3] or '—'}</b>\n\n🆔 <code>{ch[1]}</code>\n🔗 {ch[2] or '—'}",
+        parse_mode="HTML",
+        reply_markup=channel_detail_keyboard(row_id),
     )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("chedit_"))
+async def channel_edit_start(callback: CallbackQuery, state: FSMContext):
+    row_id = int(callback.data.removeprefix("chedit_"))
+    await state.set_state(ChannelEdit.channel_id)
+    await state.update_data(row_id=row_id)
+    await callback.message.answer(
+        "🆔 Yangi kanal <b>ID / @username</b>ini yuboring:", parse_mode="HTML")
+    await callback.answer()
+
+
+@router.message(ChannelEdit.channel_id)
+async def channel_edit_id(message: Message, state: FSMContext):
+    await state.update_data(channel_id=message.text.strip())
+    await state.set_state(ChannelEdit.url)
+    await message.answer("🔗 Yangi <b>havola</b>ni yuboring:", parse_mode="HTML")
+
+
+@router.message(ChannelEdit.url)
+async def channel_edit_url(message: Message, state: FSMContext):
+    await state.update_data(url=message.text.strip())
+    await state.set_state(ChannelEdit.title)
+    await message.answer("🏷 Yangi <b>nom</b>ni yuboring:", parse_mode="HTML")
+
+
+@router.message(ChannelEdit.title)
+async def channel_edit_title(message: Message, state: FSMContext):
+    data = await state.get_data()
+    update_channel(data["row_id"], data["channel_id"], data["url"], message.text.strip())
+    await state.clear()
+    await message.answer("✅ Kanal yangilandi.", reply_markup=admin_menu_keyboard())
+
+
+@router.callback_query(F.data.startswith("chdelconfirm_"))
+async def channel_delete_confirm(callback: CallbackQuery):
+    row_id = int(callback.data.removeprefix("chdelconfirm_"))
+    delete_channel(row_id)
+    await callback.message.edit_text("✅ Kanal o'chirildi.",
+                                     reply_markup=channels_list_keyboard(get_channels()))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("chdel_"))
+async def channel_delete_ask(callback: CallbackQuery):
+    row_id = int(callback.data.removeprefix("chdel_"))
+    await callback.message.edit_text(
+        "🗑 Ushbu kanal o'chirilsinmi?",
+        reply_markup=channel_delete_confirm_keyboard(row_id),
+    )
+    await callback.answer()
