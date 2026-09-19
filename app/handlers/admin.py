@@ -121,7 +121,7 @@ async def admin_home(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-@router.message(Command("bekor"))
+@router.message(Command("bekor"), F.from_user.id == ADMIN_ID)
 async def cancel_any(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
