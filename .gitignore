@@ -1,11 +1,8 @@
-venv/
+.env
+*.db
+*.db-journal
+*.backup
+*.restore
 __pycache__/
 *.pyc
-
-# Tokenni GitHub'ga hech qachon yubormaymiz — Railway/Render'da
-# Environment Variables orqali qo'shiladi
-data/.env
-
-# Baza faylini ham push qilmaymiz (u serverda avtomatik yaratiladi;
-# doimiy saqlanishi uchun Railway/Render'da Volume ulanadi)
-data/movies.db
+.venv/
