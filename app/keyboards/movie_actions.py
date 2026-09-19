@@ -13,7 +13,7 @@ def movie_actions_keyboard(code: str) -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton(text="🎞 Videoni almashtirish", callback_data=f"edit_video_{code}")],
         [InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"delete_{code}")],
-        [InlineKeyboardButton(text="⬅️ Ro'yxatga qaytish", callback_data="list_0")],
+        [InlineKeyboardButton(text="⬅️ Ro'yxatga qaytish", callback_data="list_all_0")],
     ])
 
 
@@ -28,6 +28,6 @@ def confirm_delete_keyboard(code: str) -> InlineKeyboardMarkup:
 
 def category_edit_keyboard(code: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎬 Kino", callback_data=f"setcat_kino_{code}")],
-        [InlineKeyboardButton(text="🧸 Multfilm", callback_data=f"setcat_multfilm_{code}")],
+        [InlineKeyboardButton(text="🟦 Kino", callback_data=f"setcat_kino_{code}")],
+        [InlineKeyboardButton(text="🟪 Multfilm", callback_data=f"setcat_multfilm_{code}")],
     ])
